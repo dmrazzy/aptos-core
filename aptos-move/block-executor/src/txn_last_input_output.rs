@@ -15,12 +15,16 @@ use aptos_types::{
     fee_statement::FeeStatement,
     state_store::state_value::StateValueMetadata,
     transaction::BlockExecutableTransaction as Transaction,
+    vm::modules::AptosModuleExtension,
     write_set::WriteOp,
 };
+use aptos_vm_types::module_write_set::ModuleWrite;
 use arc_swap::ArcSwapOption;
 use crossbeam::utils::CachePadded;
 use dashmap::DashSet;
-use move_core_types::value::MoveTypeLayout;
+use move_binary_format::CompiledModule;
+use move_core_types::{language_storage::ModuleId, value::MoveTypeLayout};
+use move_vm_runtime::{Module, RuntimeEnvironment};
 use std::{
     collections::{BTreeMap, HashSet},
     fmt::Debug,
@@ -28,14 +32,14 @@ use std::{
     sync::Arc,
 };
 
-type TxnInput<T> = CapturedReads<T>;
+type TxnInput<T> = CapturedReads<T, ModuleId, CompiledModule, Module, AptosModuleExtension>;
 
 macro_rules! forward_on_success_or_skip_rest {
     ($self:ident, $txn_idx:ident, $f:ident) => {{
         $self.outputs[$txn_idx as usize]
             .load()
             .as_ref()
-            .map_or(vec![], |txn_output| match txn_output.as_ref() {
+            .map_or_else(Vec::new, |txn_output| match txn_output.as_ref() {
                 ExecutionStatus::Success(t) | ExecutionStatus::SkipRest(t) => t.$f(),
                 ExecutionStatus::Abort(_)
                 | ExecutionStatus::SpeculativeExecutionAbortError(_)
@@ -126,24 +130,31 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
     pub(crate) fn record(
         &self,
         txn_idx: TxnIndex,
-        input: CapturedReads<T>,
+        input: TxnInput<T>,
         output: ExecutionStatus<O, E>,
         arced_resource_writes: Vec<(T::Key, Arc<T::Value>, Option<Arc<MoveTypeLayout>>)>,
         group_keys_and_tags: Vec<(T::Key, HashSet<T::Tag>)>,
+        runtime_environment: &RuntimeEnvironment,
     ) -> bool {
-        let written_modules = match &output {
-            ExecutionStatus::Success(output) | ExecutionStatus::SkipRest(output) => {
-                output.module_write_set()
-            },
-            ExecutionStatus::Abort(_)
-            | ExecutionStatus::SpeculativeExecutionAbortError(_)
-            | ExecutionStatus::DelayedFieldsCodeInvariantError(_) => BTreeMap::new(),
-        };
+        if !runtime_environment.vm_config().use_loader_v2 {
+            // Loader V1 implementation does not support concurrent module publishing, and so
+            // we need to record if there is one and fall back to sequential execution.
+            let written_modules = match &output {
+                ExecutionStatus::Success(output) | ExecutionStatus::SkipRest(output) => {
+                    output.module_write_set()
+                },
+                ExecutionStatus::Abort(_)
+                | ExecutionStatus::SpeculativeExecutionAbortError(_)
+                | ExecutionStatus::DelayedFieldsCodeInvariantError(_) => BTreeMap::new(),
+            };
 
-        if self
-            .check_and_append_module_rw_conflict(input.module_reads.iter(), written_modules.keys())
-        {
-            return false;
+            #[allow(deprecated)]
+            if self.check_and_append_module_rw_conflict(
+                input.deprecated_module_reads.iter(),
+                written_modules.keys(),
+            ) {
+                return false;
+            }
         }
 
         *self.arced_resource_writes[txn_idx as usize].acquire() = arced_resource_writes;
@@ -164,7 +175,7 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
             || Self::append_and_check(module_writes_keys, &self.module_writes, &self.module_reads)
     }
 
-    pub(crate) fn read_set(&self, txn_idx: TxnIndex) -> Option<Arc<CapturedReads<T>>> {
+    pub(crate) fn read_set(&self, txn_idx: TxnIndex) -> Option<Arc<TxnInput<T>>> {
         self.inputs[txn_idx as usize].load_full()
     }
 
@@ -273,15 +284,15 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
     }
 
     // Extracts a set of paths (keys) written or updated during execution from transaction
-    // output, .1 for each item is false for non-module paths and true for module paths.
-    // If TAKE_GROUP_TAGS is set, the final HashSet of tags is moved for the group key -
-    // should be called once for each incarnation / record due to 'take'. if TAKE_GROUP_TAGS
-    // is false, stored modified group resource tags in the group are cloned out.
-    pub(crate) fn modified_keys<const TAKE_GROUP_TAGS: bool>(
+    // output, with corresponding KeyKind. If take_group_tags is true, the final HashSet
+    // of tags is moved for the group key - should be called once for each incarnation / record
+    // due to 'take'. if false, stored modified group resource tags in the group are cloned out.
+    pub(crate) fn modified_keys(
         &self,
         txn_idx: TxnIndex,
+        take_group_tags: bool,
     ) -> Option<impl Iterator<Item = (T::Key, KeyKind<T::Tag>)>> {
-        let group_keys_and_tags: Vec<(T::Key, HashSet<T::Tag>)> = if TAKE_GROUP_TAGS {
+        let group_keys_and_tags: Vec<(T::Key, HashSet<T::Tag>)> = if take_group_tags {
             std::mem::take(&mut self.resource_group_keys_and_tags[txn_idx as usize].acquire())
         } else {
             self.resource_group_keys_and_tags[txn_idx as usize]
@@ -319,6 +330,27 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
                 | ExecutionStatus::SpeculativeExecutionAbortError(_)
                 | ExecutionStatus::DelayedFieldsCodeInvariantError(_) => None,
             })
+    }
+
+    pub(crate) fn module_write_set(
+        &self,
+        txn_idx: TxnIndex,
+    ) -> BTreeMap<T::Key, ModuleWrite<T::Value>> {
+        use ExecutionStatus as E;
+
+        match self.outputs[txn_idx as usize]
+            .load()
+            .as_ref()
+            .map(|status| status.as_ref())
+        {
+            Some(E::Success(t) | E::SkipRest(t)) => t.module_write_set(),
+            Some(
+                E::Abort(_)
+                | E::DelayedFieldsCodeInvariantError(_)
+                | E::SpeculativeExecutionAbortError(_),
+            )
+            | None => BTreeMap::new(),
+        }
     }
 
     pub(crate) fn delayed_field_keys(
@@ -367,9 +399,9 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
         &self,
         txn_idx: TxnIndex,
     ) -> Box<dyn Iterator<Item = (T::Event, Option<MoveTypeLayout>)>> {
-        self.outputs[txn_idx as usize].load().as_ref().map_or(
-            Box::new(empty::<(T::Event, Option<MoveTypeLayout>)>()),
-            |txn_output| match txn_output.as_ref() {
+        match self.outputs[txn_idx as usize].load().as_ref() {
+            None => Box::new(empty::<(T::Event, Option<MoveTypeLayout>)>()),
+            Some(txn_output) => match txn_output.as_ref() {
                 ExecutionStatus::Success(t) | ExecutionStatus::SkipRest(t) => {
                     let events = t.get_events();
                     Box::new(events.into_iter())
@@ -380,7 +412,7 @@ impl<T: Transaction, O: TransactionOutput<Txn = T>, E: Debug + Send + Clone>
                     Box::new(empty::<(T::Event, Option<MoveTypeLayout>)>())
                 },
             },
-        )
+        }
     }
 
     pub(crate) fn take_resource_write_set(

@@ -2,37 +2,29 @@
 // Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    block_executor::{BlockExecutor, TransactionBlockExecutor},
-    components::chunk_output::ChunkOutput,
-};
+use crate::block_executor::BlockExecutor;
 use anyhow::Result;
 use aptos_crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
 use aptos_executor_types::BlockExecutorTrait;
-use aptos_storage_interface::{
-    cached_state_view::{CachedStateView, ShardedStateCache},
-    state_delta::StateDelta,
-    DbReader, DbReaderWriter, DbWriter,
-};
+use aptos_storage_interface::{chunk_to_commit::ChunkToCommit, DbReader, DbReaderWriter, DbWriter};
 use aptos_types::{
     block_executor::{
-        config::BlockExecutorConfigFromOnchain,
-        partitioner::{ExecutableTransactions, PartitionedTransactions},
+        config::BlockExecutorConfigFromOnchain, partitioner::PartitionedTransactions,
     },
     ledger_info::LedgerInfoWithSignatures,
-    state_store::{ShardedStateUpdates, StateView},
+    state_store::StateView,
     test_helpers::transaction_test_helpers::TEST_BLOCK_EXECUTOR_ONCHAIN_CONFIG,
     transaction::{
         signature_verified_transaction::{
             into_signature_verified_block, SignatureVerifiedTransaction,
         },
-        BlockOutput, Transaction, TransactionOutput, TransactionToCommit, Version,
+        BlockOutput, Transaction, TransactionOutput, Version,
     },
     vm_status::VMStatus,
 };
 use aptos_vm::{
     sharded_block_executor::{executor_client::ExecutorClient, ShardedBlockExecutor},
-    VMExecutor,
+    VMBlockExecutor,
 };
 use std::sync::Arc;
 
@@ -65,20 +57,14 @@ pub fn fuzz_execute_and_commit_blocks(
     let _res = executor.commit_blocks(block_ids, ledger_info_with_sigs);
 }
 
-/// A fake VM implementing VMExecutor
+/// A fake VM implementing VMBlockExecutor
 pub struct FakeVM;
 
-impl TransactionBlockExecutor for FakeVM {
-    fn execute_transaction_block(
-        transactions: ExecutableTransactions,
-        state_view: CachedStateView,
-        onchain_config: BlockExecutorConfigFromOnchain,
-    ) -> Result<ChunkOutput> {
-        ChunkOutput::by_transaction_execution::<FakeVM>(transactions, state_view, onchain_config)
+impl VMBlockExecutor for FakeVM {
+    fn new() -> Self {
+        Self
     }
-}
 
-impl VMExecutor for FakeVM {
     fn execute_block_sharded<S: StateView + Send + Sync, E: ExecutorClient<S>>(
         _sharded_block_executor: &ShardedBlockExecutor<S, E>,
         _transactions: PartitionedTransactions,
@@ -89,6 +75,7 @@ impl VMExecutor for FakeVM {
     }
 
     fn execute_block(
+        &self,
         _transactions: &[SignatureVerifiedTransaction],
         _state_view: &impl StateView,
         _onchain_config: BlockExecutorConfigFromOnchain,
@@ -115,13 +102,8 @@ impl DbReader for FakeDb {
 impl DbWriter for FakeDb {
     fn pre_commit_ledger(
         &self,
-        _txns_to_commit: &[TransactionToCommit],
-        _first_version: Version,
-        _base_state_version: Option<Version>,
+        _chunk: ChunkToCommit,
         _sync_commit: bool,
-        _latest_in_memory_state: StateDelta,
-        _state_updates_until_last_checkpoint: Option<ShardedStateUpdates>,
-        _sharded_state_cache: Option<&ShardedStateCache>,
     ) -> aptos_storage_interface::Result<()> {
         Ok(())
     }
@@ -130,7 +112,7 @@ impl DbWriter for FakeDb {
         &self,
         _version: Version,
         _ledger_info_with_sigs: Option<&LedgerInfoWithSignatures>,
-        _txns_to_commit: Option<&[TransactionToCommit]>,
+        _chunk: Option<ChunkToCommit>,
     ) -> aptos_storage_interface::Result<()> {
         Ok(())
     }
